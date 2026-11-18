@@ -3,6 +3,7 @@ import re
 import os
 import sys
 import pickle
+import threading
 from .._compat import *
 
 MIN_FLOAT = -3.14e100
@@ -20,6 +21,9 @@ PrevStatus = {
 }
 
 Force_Split_Words = set([])
+_force_split_lock = threading.Lock()
+
+
 def load_model():
     start_p = pickle.load(get_module_res("finalseg", PROB_START_P))
     trans_p = pickle.load(get_module_res("finalseg", PROB_TRANS_P))
@@ -79,16 +83,22 @@ re_skip = re.compile("([a-zA-Z0-9]+(?:\.\d+)?%?)")
 
 
 def add_force_split(word):
-    global Force_Split_Words
-    Force_Split_Words.add(word)
+    # Legacy module-level API kept for backward compatibility.
+    # jieba.Tokenizer no longer relies on this global set; it tracks
+    # force-split words per instance (see Tokenizer.add_word).
+    with _force_split_lock:
+        Force_Split_Words.add(word)
 
-def cut(sentence):
+
+def cut(sentence, force_split_words=None):
     sentence = strdecode(sentence)
+    if force_split_words is None:
+        force_split_words = Force_Split_Words
     blocks = re_han.split(sentence)
     for blk in blocks:
         if re_han.match(blk):
             for word in __cut(blk):
-                if word not in Force_Split_Words:
+                if word not in force_split_words:
                     yield word
                 else:
                     for c in word:

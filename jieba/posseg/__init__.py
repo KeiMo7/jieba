@@ -95,7 +95,9 @@ class POSTokenizer(object):
         self.load_word_tag(self.tokenizer.get_dict_file())
 
     def load_word_tag(self, f):
-        self.word_tag_tab = {}
+        # build the table first, then publish it atomically so concurrent
+        # cuts never observe a half-loaded table
+        word_tag_tab = {}
         f_name = resolve_filename(f)
         for lineno, line in enumerate(f, 1):
             try:
@@ -103,16 +105,23 @@ class POSTokenizer(object):
                 if not line:
                     continue
                 word, _, tag = line.split(" ")
-                self.word_tag_tab[word] = tag
+                word_tag_tab[word] = tag
             except Exception:
                 raise ValueError(
                     'invalid POS dictionary entry in %s at Line %s: %s' % (f_name, lineno, line))
         f.close()
+        self.word_tag_tab = word_tag_tab
 
     def makesure_userdict_loaded(self):
-        if self.tokenizer.user_word_tag_tab:
-            self.word_tag_tab.update(self.tokenizer.user_word_tag_tab)
-            self.tokenizer.user_word_tag_tab = {}
+        tokenizer = self.tokenizer
+        if tokenizer.user_word_tag_tab:
+            with tokenizer._write_lock:
+                if tokenizer.user_word_tag_tab:
+                    merged = self.word_tag_tab.copy()
+                    merged.update(tokenizer.user_word_tag_tab)
+                    # atomic swap; in-flight cuts keep the previous table
+                    self.word_tag_tab = merged
+                    tokenizer.user_word_tag_tab = {}
 
     def __cut(self, sentence):
         prob, pos_list = viterbi(
@@ -149,10 +158,10 @@ class POSTokenizer(object):
                         else:
                             yield pair(x, 'x')
 
-    def __cut_DAG_NO_HMM(self, sentence):
-        DAG = self.tokenizer.get_DAG(sentence)
+    def __cut_DAG_NO_HMM(self, sentence, state):
+        DAG = self.tokenizer.get_DAG(sentence, state)
         route = {}
-        self.tokenizer.calc(sentence, DAG, route)
+        self.tokenizer.calc(sentence, DAG, route, state)
         x = 0
         N = len(sentence)
         buf = ''
@@ -172,12 +181,13 @@ class POSTokenizer(object):
             yield pair(buf, 'eng')
             buf = ''
 
-    def __cut_DAG(self, sentence):
-        DAG = self.tokenizer.get_DAG(sentence)
+    def __cut_DAG(self, sentence, state):
+        DAG = self.tokenizer.get_DAG(sentence, state)
         route = {}
 
-        self.tokenizer.calc(sentence, DAG, route)
+        self.tokenizer.calc(sentence, DAG, route, state)
 
+        freq = state.freq
         x = 0
         buf = ''
         N = len(sentence)
@@ -190,7 +200,7 @@ class POSTokenizer(object):
                 if buf:
                     if len(buf) == 1:
                         yield pair(buf, self.word_tag_tab.get(buf, 'x'))
-                    elif not self.tokenizer.FREQ.get(buf):
+                    elif not freq.get(buf):
                         recognized = self.__cut_detail(buf)
                         for t in recognized:
                             yield t
@@ -204,7 +214,7 @@ class POSTokenizer(object):
         if buf:
             if len(buf) == 1:
                 yield pair(buf, self.word_tag_tab.get(buf, 'x'))
-            elif not self.tokenizer.FREQ.get(buf):
+            elif not freq.get(buf):
                 recognized = self.__cut_detail(buf)
                 for t in recognized:
                     yield t
@@ -215,6 +225,8 @@ class POSTokenizer(object):
     def __cut_internal(self, sentence, HMM=True):
         self.makesure_userdict_loaded()
         sentence = strdecode(sentence)
+        self.tokenizer.check_initialized()
+        state = self.tokenizer._dict_state
         blocks = re_han_internal.split(sentence)
         if HMM:
             cut_blk = self.__cut_DAG
@@ -223,7 +235,7 @@ class POSTokenizer(object):
 
         for blk in blocks:
             if re_han_internal.match(blk):
-                for word in cut_blk(blk):
+                for word in cut_blk(blk, state):
                     yield word
             else:
                 tmp = re_skip_internal.split(blk)
