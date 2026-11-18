@@ -82,6 +82,12 @@ def add_force_split(word):
     global Force_Split_Words
     Force_Split_Words.add(word)
 
+
+def remove_force_split(word):
+    global Force_Split_Words
+    Force_Split_Words.discard(word)
+
+
 def cut(sentence):
     sentence = strdecode(sentence)
     blocks = re_han.split(sentence)

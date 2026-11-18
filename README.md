@@ -139,6 +139,28 @@ print(", ".join(seg_list))
 
 * "通过用户自定义词典来增强歧义纠错能力" --- https://github.com/fxsjy/jieba/issues/14
 
+### 不中断服务的词典热加载
+
+`reload_userdict` 在后台完成文件校验和增量构建，再一次性切换词典版本。加载期间已经开始的请求继续使用旧快照，新请求使用新快照，不会读到部分更新的词典。
+
+```python
+result = jieba.reload_userdict("userdict.txt")
+print(result["version_before"], result["version_after"])
+print(result["entry_count_before"], result["entry_count_after"])
+print(result["invalidated_cache_entries"])
+
+info = jieba.get_dict_info()
+print(info["version"], info["entry_count"], info["last_load_time"])
+```
+
+* 词典格式不变。空文件视为无变更；重复条目以最后一次为准，并在结果的 `duplicates` 中计数。
+* 格式或编码错误会抛出 `jieba.DictionaryLoadError`，异常和 `get_dict_info()["last_error"]` 均包含文件名、行号和条目片段，旧词典继续可用。
+* `jieba.rollback()` 原子切回上一版本。
+* `jieba.enable_auto_reload("userdict.txt", interval=60)` 启动文件监听，默认间隔 60 秒。手动 `reload_userdict` 与自动加载共用串行锁和文件签名，不会并行改写；`jieba.disable_auto_reload()` 停止监听。
+* 手动触发时可用 `force=True` 在文件签名未变化时重新校验。
+* 分词结果使用有界 LRU 缓存，默认 1024 条，可通过 `jieba.set_cache_size(n)` 调整或设为 0 关闭。发布新词时只失效包含变更词的缓存，并返回失效数量。
+* `Tokenizer.max_reload_block_seconds` 默认 0.2 秒；状态切换实际耗时记录在结果的 `switch_seconds` 中，超阈值会记录告警。解析和构建不持有请求锁。
+
 3. 关键词提取
 -------------
 ### 基于 TF-IDF 算法的关键词抽取
@@ -590,6 +612,23 @@ Output:
 
         [After]：　李小福 / 是 / 创新办 / 主任 / 也 / 是 / 云计算 / 方面 / 的 / 专家 /
 
+### Hot reload without restarting
+
+```python
+result = jieba.reload_userdict("userdict.txt")
+status = jieba.get_dict_info()
+jieba.enable_auto_reload("userdict.txt", interval=60)
+jieba.rollback()
+```
+
+Reloading validates the complete file before publishing, applies only changed
+entries as a delta over the existing prefix dictionary, and atomically swaps a
+snapshot. In-flight requests keep the old snapshot. Format errors raise
+`DictionaryLoadError` with line and entry context while the old dictionary
+remains active. Empty files are ignored, duplicate entries use the last value,
+and reload/cache counts are returned in the result dictionary. The automatic
+watcher and manual reload share the same serialized update path.
+
 
 ### Modify dictionary
 
@@ -785,4 +824,3 @@ Segmentation speed
 * 1.5 MB / Second in Full Mode
 * 400 KB / Second in Default Mode
 * Test Env: Intel(R) Core(TM) i7-2600 CPU @ 3.4GHz；《围城》.txt
-

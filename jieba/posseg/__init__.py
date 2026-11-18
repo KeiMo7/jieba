@@ -114,6 +114,9 @@ class POSTokenizer(object):
             self.word_tag_tab.update(self.tokenizer.user_word_tag_tab)
             self.tokenizer.user_word_tag_tab = {}
 
+    def _word_tag(self, word, user_tags):
+        return user_tags.get(word, self.word_tag_tab.get(word, 'x'))
+
     def __cut(self, sentence):
         prob, pos_list = viterbi(
             sentence, char_state_tab_P, start_P, trans_P, emit_P)
@@ -149,10 +152,10 @@ class POSTokenizer(object):
                         else:
                             yield pair(x, 'x')
 
-    def __cut_DAG_NO_HMM(self, sentence):
-        DAG = self.tokenizer.get_DAG(sentence)
+    def __cut_DAG_NO_HMM(self, sentence, state, user_tags):
+        DAG = self.tokenizer.get_DAG(sentence, state)
         route = {}
-        self.tokenizer.calc(sentence, DAG, route)
+        self.tokenizer.calc(sentence, DAG, route, state)
         x = 0
         N = len(sentence)
         buf = ''
@@ -166,17 +169,17 @@ class POSTokenizer(object):
                 if buf:
                     yield pair(buf, 'eng')
                     buf = ''
-                yield pair(l_word, self.word_tag_tab.get(l_word, 'x'))
+                yield pair(l_word, self._word_tag(l_word, user_tags))
                 x = y
         if buf:
             yield pair(buf, 'eng')
             buf = ''
 
-    def __cut_DAG(self, sentence):
-        DAG = self.tokenizer.get_DAG(sentence)
+    def __cut_DAG(self, sentence, state, user_tags):
+        DAG = self.tokenizer.get_DAG(sentence, state)
         route = {}
 
-        self.tokenizer.calc(sentence, DAG, route)
+        self.tokenizer.calc(sentence, DAG, route, state)
 
         x = 0
         buf = ''
@@ -189,31 +192,34 @@ class POSTokenizer(object):
             else:
                 if buf:
                     if len(buf) == 1:
-                        yield pair(buf, self.word_tag_tab.get(buf, 'x'))
-                    elif not self.tokenizer.FREQ.get(buf):
+                        yield pair(buf, self._word_tag(buf, user_tags))
+                    elif not state.freq.get(buf):
                         recognized = self.__cut_detail(buf)
                         for t in recognized:
                             yield t
                     else:
                         for elem in buf:
-                            yield pair(elem, self.word_tag_tab.get(elem, 'x'))
+                            yield pair(
+                                elem, self._word_tag(elem, user_tags))
                     buf = ''
-                yield pair(l_word, self.word_tag_tab.get(l_word, 'x'))
+                yield pair(l_word, self._word_tag(l_word, user_tags))
             x = y
 
         if buf:
             if len(buf) == 1:
-                yield pair(buf, self.word_tag_tab.get(buf, 'x'))
-            elif not self.tokenizer.FREQ.get(buf):
+                yield pair(buf, self._word_tag(buf, user_tags))
+            elif not state.freq.get(buf):
                 recognized = self.__cut_detail(buf)
                 for t in recognized:
                     yield t
             else:
                 for elem in buf:
-                    yield pair(elem, self.word_tag_tab.get(elem, 'x'))
+                    yield pair(elem, self._word_tag(elem, user_tags))
 
-    def __cut_internal(self, sentence, HMM=True):
-        self.makesure_userdict_loaded()
+    def __cut_internal(self, sentence, HMM=True, state=None):
+        if state is None:
+            state = self.tokenizer._snapshot()
+        user_tags = state.user_tags
         sentence = strdecode(sentence)
         blocks = re_han_internal.split(sentence)
         if HMM:
@@ -223,7 +229,7 @@ class POSTokenizer(object):
 
         for blk in blocks:
             if re_han_internal.match(blk):
-                for word in cut_blk(blk):
+                for word in cut_blk(blk, state, user_tags):
                     yield word
             else:
                 tmp = re_skip_internal.split(blk)
@@ -246,8 +252,13 @@ class POSTokenizer(object):
         return list(self.__cut_internal(sentence, False))
 
     def cut(self, sentence, HMM=True):
-        for w in self.__cut_internal(sentence, HMM=HMM):
-            yield w
+        state = self.tokenizer._snapshot()
+
+        def iter_cut():
+            for w in self.__cut_internal(sentence, HMM=HMM, state=state):
+                yield w
+
+        return iter_cut()
 
     def lcut(self, *args, **kwargs):
         return list(self.cut(*args, **kwargs))
