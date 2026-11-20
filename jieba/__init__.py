@@ -12,6 +12,8 @@ from hashlib import md5
 from math import log
 
 from . import finalseg
+from . import dicttrack
+from .dicttrack import DictFormatError, DictVersionNotFoundError
 from ._compat import *
 
 if os.name == 'nt':
@@ -52,7 +54,8 @@ def setLogLevel(log_level):
 
 class Tokenizer(object):
 
-    def __init__(self, dictionary=DEFAULT_DICT):
+    def __init__(self, dictionary=DEFAULT_DICT, track_versions=False,
+                 version_store_dir=None):
         self.lock = threading.RLock()
         if dictionary == DEFAULT_DICT:
             self.dictionary = dictionary
@@ -64,6 +67,12 @@ class Tokenizer(object):
         self.initialized = False
         self.tmp_dir = None
         self.cache_file = None
+        # 词典版本记录，默认关闭；开启不改变分词结果，只增加记录
+        self._tracker = None
+        self._tracker_store_dir = version_store_dir
+        self._suppress_word_events = False
+        if track_versions:
+            self.enable_version_tracking(version_store_dir)
 
     def __repr__(self):
         return '<Tokenizer dictionary=%r>' % self.dictionary
@@ -164,6 +173,9 @@ class Tokenizer(object):
             default_logger.debug(
                 "Loading model cost %.3f seconds." % (time.time() - t1))
             default_logger.debug("Prefix dict has been built successfully.")
+            if self._tracker is not None:
+                self._tracker.record_main_dict(
+                    abs_path, from_cache=not load_from_cache_fail)
 
     def check_initialized(self):
         if not self.initialized:
@@ -392,6 +404,10 @@ class Tokenizer(object):
         ...
         Word type may be ignored
         '''
+        if self._tracker is not None:
+            # 开启版本记录时走严格解析 + 冲突检测 + 记录的路径，
+            # 词条应用仍走同一个 add_word，分词结果与原路径一致。
+            return self._load_userdict_tracked(f)
         self.check_initialized()
         if isinstance(f, string_types):
             f_name = f
@@ -415,6 +431,117 @@ class Tokenizer(object):
                 tag = tag.strip()
             self.add_word(word, freq, tag)
 
+    def _load_userdict_tracked(self, f):
+        """
+        版本记录开启时的用户词典加载路径：
+        严格校验格式（出错报行号并拒绝加载）、检测冲突词条（同名不同词频，
+        后加载覆盖先加载，记录最终生效值）、落盘快照与加载历史。
+        """
+        self.check_initialized()
+        opened = None
+        if isinstance(f, string_types):
+            f_name = f
+            opened = f = open(f, 'rb')
+        else:
+            f_name = resolve_filename(f)
+        try:
+            # 第一遍：严格解析整个文件。任何一行格式错误都抛出
+            # DictFormatError（带行号），整个文件拒绝加载。
+            parsed = []
+            for lineno, ln in enumerate(f, 1):
+                line = ln.strip()
+                if not isinstance(line, text_type):
+                    try:
+                        line = line.decode('utf-8').lstrip('\ufeff')
+                    except UnicodeDecodeError:
+                        raise DictFormatError(f_name, lineno, '<binary data>',
+                                              'dictionary file must be utf-8')
+                if not line:
+                    continue
+                parsed.append(dicttrack.parse_userdict_line(line, f_name, lineno))
+        finally:
+            if opened is not None:
+                opened.close()
+        # 第二遍：应用词条（与原有 add_word 路径一致），同时检测冲突。
+        entries = {}
+        conflicts = []
+        self._suppress_word_events = True
+        try:
+            for word, freq, tag in parsed:
+                # 冲突检测：该词已是有词频的词条（非前缀碎片），且新词频不同。
+                # 生效规则与既有行为一致：后加载覆盖先加载。
+                old_freq = self.FREQ.get(word)
+                new_freq = (int(freq) if freq is not None
+                            else self.suggest_freq(word, False))
+                if old_freq and old_freq != new_freq:
+                    conflicts.append({
+                        'word': word,
+                        'previous_freq': old_freq,
+                        'incoming_freq': new_freq,
+                        'effective_freq': new_freq,
+                    })
+                self.add_word(word, freq, tag)
+                entries[word] = (self.FREQ[word], tag)
+        finally:
+            self._suppress_word_events = False
+        self._tracker.record_userdict(f_name, entries, conflicts)
+
+    def enable_version_tracking(self, store_dir=None):
+        """
+        开启词典版本记录（默认关闭）。只记录，不改变分词结果。
+
+        Parameter:
+            - store_dir: 快照与加载历史的存储目录，
+                         默认 ~/.jieba_dict_versions，
+                         可用环境变量 JIEBA_DICT_VERSION_DIR 覆盖。
+        """
+        with self.lock:
+            if self._tracker is None:
+                self._tracker = dicttrack.DictTracker(
+                    self, store_dir or self._tracker_store_dir)
+                if self.initialized:
+                    # 已在开启前完成初始化的，补记当前主词典状态
+                    self._tracker.record_main_dict(self.dictionary)
+            return self._tracker
+
+    def disable_version_tracking(self):
+        """关闭词典版本记录。之后的行为与从未开启一致。"""
+        with self.lock:
+            self._tracker = None
+
+    def current_dict_version(self):
+        """当前词典状态的版本号（由有序的加载事件摘要链合成）；未开启记录时为 None。"""
+        if self._tracker is None:
+            return None
+        return self._tracker.state_version()
+
+    def version_info(self):
+        """当前版本号 + 全部加载记录（来源、条目数、内容摘要、加载时间、冲突）。"""
+        if self._tracker is None:
+            return {'tracking': False, 'version': None, 'loads': []}
+        return {
+            'tracking': True,
+            'version': self._tracker.state_version(),
+            'store_dir': self._tracker.store.dir,
+            'loads': list(self._tracker.records),
+        }
+
+    def load_history(self):
+        """本次开启记录以来的加载记录列表。"""
+        if self._tracker is None:
+            return []
+        return list(self._tracker.records)
+
+    def lcut_with_version(self, sentence, cut_all=False, HMM=True):
+        """
+        与 lcut 相同，但返回值带上分词时所用词典的版本号，
+        便于判断两份结果是否基于同一词典状态、是否可比。
+        """
+        return {
+            'words': self.lcut(sentence, cut_all=cut_all, HMM=HMM),
+            'dict_version': self.current_dict_version(),
+        }
+
     def add_word(self, word, freq=None, tag=None):
         """
         Add a word to dictionary.
@@ -435,6 +562,9 @@ class Tokenizer(object):
                 self.FREQ[wfrag] = 0
         if freq == 0:
             finalseg.add_force_split(word)
+        tracker = self._tracker
+        if tracker is not None and not self._suppress_word_events:
+            tracker.record_add_word(word, freq, tag)
 
     def del_word(self, word):
         """
@@ -561,6 +691,81 @@ def _lcut_for_search(s):
 
 def _lcut_for_search_no_hmm(s):
     return dt._lcut_for_search_no_hmm(s)
+
+
+# ---- 词典版本记录 / 差异 / 回放（默认关闭，开启后分词结果不变）----
+
+def enable_dict_tracking(store_dir=None):
+    """
+    为默认分词器 dt 开启词典版本记录。
+
+    Parameter:
+        - store_dir: 快照与加载历史存储目录，默认 ~/.jieba_dict_versions，
+                     可用环境变量 JIEBA_DICT_VERSION_DIR 覆盖。
+    """
+    return dt.enable_version_tracking(store_dir)
+
+
+def disable_dict_tracking():
+    """关闭默认分词器的词典版本记录。"""
+    dt.disable_version_tracking()
+
+
+def dict_version():
+    """默认分词器当前词典状态的版本号；未开启记录时为 None。"""
+    return dt.current_dict_version()
+
+
+def dict_history():
+    """默认分词器本次开启记录以来的加载记录。"""
+    return dt.load_history()
+
+
+def lcut_with_version(sentence, cut_all=False, HMM=True):
+    """同 lcut，但结果带上所用词典的版本号。"""
+    return dt.lcut_with_version(sentence, cut_all=cut_all, HMM=HMM)
+
+
+def _tracking_store(store_dir=None):
+    if store_dir is None and dt._tracker is not None:
+        store_dir = dt._tracker.store.dir
+    return dicttrack.VersionStore(store_dir)
+
+
+def dict_diff(version_a, version_b, store_dir=None):
+    """
+    对比两个状态版本（dict_version() 的返回值）的生效词条差异：
+    新增、删除、词频/词性调整（from -> to）。
+    """
+    return dicttrack.diff_versions(_tracking_store(store_dir),
+                                   version_a, version_b)
+
+
+def dict_diff_files(file_a, file_b):
+    """直接对比两个用户词典文件（无需开启记录）。"""
+    return dicttrack.diff_files(file_a, file_b)
+
+
+def replay_tokenizer(version, store_dir=None):
+    """
+    按历史状态版本重建一个分词器（不影响默认分词器）。
+    版本或快照不存在时抛出 DictVersionNotFoundError 并给出替代做法。
+    """
+    store = _tracking_store(store_dir)
+    entries = dicttrack.entries_for_version(store, version)
+    tok = Tokenizer()
+    tok.FREQ = {}
+    tok.total = 0
+    tok.initialized = True
+    for word, (freq, tag) in iteritems(entries):
+        tok.add_word(word, freq, tag)
+    return tok
+
+
+def replay_lcut(sentence, version, store_dir=None, cut_all=False, HMM=True):
+    """用历史版本的词典重放分词，返回与当时一致的结果。"""
+    tok = replay_tokenizer(version, store_dir=store_dir)
+    return tok.lcut(sentence, cut_all=cut_all, HMM=HMM)
 
 
 def _pcut(sentence, cut_all=False, HMM=True):

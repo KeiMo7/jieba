@@ -341,6 +341,51 @@ word 有限公司            start: 6                end:10
 
     If no filename specified, use STDIN instead.
 
+9. 词典版本记录与回放
+-------------------
+
+* 背景：自定义词典被多人多次修改后，同一批文本的分词结果会悄悄变化且无法追溯。该能力记录每次词典加载（来源、条目数、内容摘要、加载时间），支持词典版本间差异对比、冲突条目检测和历史版本回放。
+* **默认关闭**，开启后分词结果与性能特征不变（仅加载时增加一次摘要计算与快照写盘）；不开启时行为与之前版本完全一致。
+* 用法：
+
+```python
+import jieba
+
+jieba.enable_dict_tracking()          # 开启记录（默认存到 ~/.jieba_dict_versions，
+                                      # 可用环境变量 JIEBA_DICT_VERSION_DIR 或
+                                      # enable_dict_tracking(store_dir=...) 指定）
+jieba.load_userdict('userdict.txt')   # 每次加载都会被记录
+v1 = jieba.dict_version()             # 当前词典状态版本号
+
+out = jieba.lcut_with_version('云计算方面的专家')
+# {'words': [...], 'dict_version': '...'}  结果自带词典版本，便于判断两份结果是否可比
+
+jieba.load_userdict('userdict_v2.txt')
+v2 = jieba.dict_version()
+
+jieba.dict_history()                  # 全部加载记录（含冲突条目及最终生效值）
+jieba.dict_diff(v1, v2)               # 两个版本间的新增/删除/词频调整（from -> to）
+jieba.dict_diff_files('a.txt', 'b.txt')  # 不开启记录也能直接对比两个词典文件
+
+jieba.replay_lcut('待分词的句子', v1) # 用 v1 版本的词典重放当时的分词结果
+jieba.disable_dict_tracking()         # 关闭记录
+```
+
+* 自定义分词器：`jieba.Tokenizer(dictionary=..., track_versions=True, version_store_dir=...)`。
+* 行为说明：
+    * 摘要基于词典**内容**（规范化后的词条/词频/词性序列），与文件修改时间无关：内容不变则版本不变。
+    * 多个词典叠加加载时，**后加载覆盖先加载**（与 jieba 既有行为一致）；同名不同词频的冲突条目会记录在加载记录的 `conflicts` 字段中，`effective_freq` 为最终生效值。
+    * 版本号由有序的加载事件摘要链合成：加载顺序不同，版本号不同。
+* 异常与降级：
+    * 开启记录后，词典格式错误会抛出 `jieba.DictFormatError`（带文件名、行号、原因），**整个文件拒绝加载**（原子拒绝，不会应用一半）；未开启记录时解析行为与原来一致。
+    * 词典条目数超过 `jieba.dicttrack.DIGEST_MAX_ENTRIES`（默认 200 万）时不计算摘要，版本标记为 `unknown` 并告警。
+    * 回放/对比时版本或快照不存在会抛出 `jieba.DictVersionNotFoundError`，错误信息中给出可行的替代做法。
+* 已知限制：
+    * 严格模式（开启记录时）要求每行为 `词语 [词频] [词性]`；词本身以数字/小数结尾、或字段过多的行会被判为格式错误。
+    * 回放基于 `add_word` 逐条重建分词器，35 万条约需 1~2 秒；回放的是 `cut`/`lcut` 结果，`posseg` 的主词典词性表不在回放范围内。
+    * 多线程下记录是线程安全的；`enable_parallel` 多进程模式中子进程的记录不会回传，请在主进程加载完词典后再开启并行。
+    * 建议每个应用使用独立的 `store_dir`；多个分词器混用同一存储目录时，回放按词典路径区分加载链。
+
 延迟加载机制
 ------------
 
@@ -614,6 +659,16 @@ Example:
 >>> print('/'.join(jieba.cut('「台中」正确应该不会被切开', HMM=False)))
 「/台中/」/正确/应该/不会/被/切开
 ```
+
+### Dictionary version tracking, diff and replay (opt-in)
+
+* Disabled by default; segmentation results are unchanged whether it is on or off.
+* `jieba.enable_dict_tracking(store_dir=None)` starts recording every dictionary load (source, entry count, content-based digest, load time) for the default Tokenizer; snapshots and history are stored under `~/.jieba_dict_versions` (override with `store_dir` or the `JIEBA_DICT_VERSION_DIR` environment variable).
+* `jieba.dict_version()` returns the current dictionary-state version; `jieba.lcut_with_version(s)` returns `{'words': ..., 'dict_version': ...}` so results can be checked for comparability.
+* `jieba.dict_history()` lists load records, including conflicting entries (same word, different freq). When dictionaries are stacked, **the later load overrides the earlier one**, and each conflict record carries the final effective value (`effective_freq`).
+* `jieba.dict_diff(v1, v2)` diffs two recorded versions (added/removed/freq-changed entries); `jieba.dict_diff_files(a, b)` diffs two dictionary files directly without enabling tracking.
+* `jieba.replay_lcut(sentence, version)` reproduces the segmentation of a historical version; missing versions/snapshots raise `jieba.DictVersionNotFoundError` with suggested alternatives.
+* With tracking on, malformed dictionary lines raise `jieba.DictFormatError` (file, line number, reason) and the whole file is rejected atomically. The digest is content-based (file mtime does not affect it); dictionaries larger than `jieba.dicttrack.DIGEST_MAX_ENTRIES` entries are marked as version `unknown` with a warning.
 
 3. Keyword Extraction
 -----------------------
